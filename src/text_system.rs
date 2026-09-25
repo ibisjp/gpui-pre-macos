@@ -1,3 +1,4 @@
+// Modified by ibis inc. for ibisOffice (2026-09-25): a font whose features turn `kern` off is laid out without kerning.
 use anyhow::anyhow;
 use cocoa::appkit::CGFloat;
 use collections::{HashMap, HashSet};
@@ -22,7 +23,7 @@ use core_text::{
         kCTFontWidthTrait,
     },
     line::CTLine,
-    string_attributes::kCTFontAttributeName,
+    string_attributes::{kCTFontAttributeName, kCTKernAttributeName},
 };
 use font_kit::{
     font::Font as FontKitFont,
@@ -71,6 +72,9 @@ struct MacTextSystemState {
     font_ids_by_postscript_name: HashMap<String, FontId>,
     font_ids_by_font_key: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     postscript_names_by_font_id: HashMap<FontId, String>,
+    /// Fonts loaded with the `kern` feature set to 0, laid out without
+    /// kerning (CoreText does not turn kerning off for the feature alone).
+    unkerned: HashSet<FontId>,
 }
 
 impl MacTextSystem {
@@ -84,6 +88,7 @@ impl MacTextSystem {
             font_ids_by_postscript_name: HashMap::default(),
             font_ids_by_font_key: HashMap::default(),
             postscript_names_by_font_id: HashMap::default(),
+            unkerned: HashSet::default(),
         }))
     }
 }
@@ -373,6 +378,9 @@ impl MacTextSystemState {
             }
             let font_id = FontId(self.fonts.len());
             font_ids.push(font_id);
+            if features.tag_value_list().iter().any(|(tag, value)| tag == "kern" && *value == 0) {
+                self.unkerned.insert(font_id);
+            }
             self.font_ids_by_postscript_name
                 .insert(postscript_name.clone(), font_id);
             self.postscript_names_by_font_id
@@ -567,6 +575,9 @@ impl MacTextSystemState {
                         kCTFontAttributeName,
                         &font.native_font().clone_with_font_size(font_size.into()),
                     );
+                    if self.unkerned.contains(&run.font_id) {
+                        string.set_attribute(cf_range, kCTKernAttributeName, &CFNumber::from(0.0f64));
+                    }
                 }
                 break_ligature = !break_ligature;
             }
