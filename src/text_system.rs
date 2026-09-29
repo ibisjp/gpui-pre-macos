@@ -1,4 +1,5 @@
 // Modified by ibis inc. for ibisOffice (2026-09-25): a font whose features turn `kern` off is laid out without kerning.
+// Modified by ibis inc. for ibisOffice (2026-09-29): implemented `PlatformTextSystem::font_data`.
 use anyhow::anyhow;
 use cocoa::appkit::CGFloat;
 use collections::{HashMap, HashSet};
@@ -75,6 +76,8 @@ struct MacTextSystemState {
     /// Fonts loaded with the `kern` feature set to 0, laid out without
     /// kerning (CoreText does not turn kerning off for the feature alone).
     unkerned: HashSet<FontId>,
+    /// Font files read for `font_data`, by path.
+    font_files: HashMap<std::path::PathBuf, Arc<Vec<u8>>>,
 }
 
 impl MacTextSystem {
@@ -89,6 +92,7 @@ impl MacTextSystem {
             font_ids_by_font_key: HashMap::default(),
             postscript_names_by_font_id: HashMap::default(),
             unkerned: HashSet::default(),
+            font_files: HashMap::default(),
         }))
     }
 }
@@ -180,6 +184,36 @@ impl PlatformTextSystem for MacTextSystem {
 
     fn font_metrics(&self, font_id: FontId) -> FontMetrics {
         font_kit_metrics_to_metrics(self.0.read().fonts[font_id.0].metrics())
+    }
+
+    fn font_data(&self, font_id: FontId) -> Option<(Arc<Vec<u8>>, u32)> {
+        let mut state = self.0.write();
+        let font = state.fonts.get(font_id.0)?.clone();
+        // A font loaded from memory (added with `add_fonts`) keeps its data.
+        if let Some(Handle::Memory { bytes, font_index }) = font.handle() {
+            return Some((bytes, font_index));
+        }
+        // An installed font: the file CoreText has it from.
+        let path = font.native_font().copy_descriptor().font_path()?;
+        let data = match state.font_files.get(&path) {
+            Some(data) => data.clone(),
+            None => {
+                let data = Arc::new(std::fs::read(&path).ok()?);
+                state.font_files.insert(path, data.clone());
+                data
+            }
+        };
+        // In a collection, the font whose PostScript name is this one's.
+        let index = if data.starts_with(b"ttcf") && data.len() >= 12 {
+            let count = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
+            let name = font.postscript_name();
+            (0..count)
+                .find(|&i| FontKitFont::from_bytes(data.clone(), i).ok().and_then(|f| f.postscript_name()) == name)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        Some((data, index))
     }
 
     fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>> {
