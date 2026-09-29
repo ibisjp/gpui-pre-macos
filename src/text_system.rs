@@ -1,5 +1,5 @@
 // Modified by ibis inc. for ibisOffice (2026-09-25): a font whose features turn `kern` off is laid out without kerning.
-// Modified by ibis inc. for ibisOffice (2026-09-29): implemented `PlatformTextSystem::font_data`.
+// Modified by ibis inc. for ibisOffice (2026-09-29): implemented `PlatformTextSystem::font_data` (fonts added with `add_fonts` keep their data for it).
 use anyhow::anyhow;
 use cocoa::appkit::CGFloat;
 use collections::{HashMap, HashSet};
@@ -78,6 +78,9 @@ struct MacTextSystemState {
     unkerned: HashSet<FontId>,
     /// Font files read for `font_data`, by path.
     font_files: HashMap<std::path::PathBuf, Arc<Vec<u8>>>,
+    /// The data of fonts added with `add_fonts`, by PostScript name, for
+    /// `font_data` (they are loaded through CoreText, which keeps no data).
+    added_font_data: HashMap<String, Arc<Vec<u8>>>,
 }
 
 impl MacTextSystem {
@@ -93,6 +96,7 @@ impl MacTextSystem {
             postscript_names_by_font_id: HashMap::default(),
             unkerned: HashSet::default(),
             font_files: HashMap::default(),
+            added_font_data: HashMap::default(),
         }))
     }
 }
@@ -189,9 +193,13 @@ impl PlatformTextSystem for MacTextSystem {
     fn font_data(&self, font_id: FontId) -> Option<(Arc<Vec<u8>>, u32)> {
         let mut state = self.0.write();
         let font = state.fonts.get(font_id.0)?.clone();
-        // A font loaded from memory (added with `add_fonts`) keeps its data.
+        // A font loaded from memory keeps its data; one added with
+        // `add_fonts` has it kept by name.
         if let Some(Handle::Memory { bytes, font_index }) = font.handle() {
             return Some((bytes, font_index));
+        }
+        if let Some(data) = font.postscript_name().and_then(|name| state.added_font_data.get(&name).cloned()) {
+            return Some((data, 0));
         }
         // An installed font: the file CoreText has it from.
         let path = font.native_font().copy_descriptor().font_path()?;
@@ -293,6 +301,12 @@ fn font_smoothing_allowed_by_user() -> bool {
 
 impl MacTextSystemState {
     fn add_fonts(&mut self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
+        for bytes in &fonts {
+            let data = Arc::new(bytes.to_vec());
+            if let Some(name) = FontKitFont::from_bytes(data.clone(), 0).ok().and_then(|f| f.postscript_name()) {
+                self.added_font_data.insert(name, data);
+            }
+        }
         let fonts = fonts
             .into_iter()
             .map(|bytes| match bytes {
