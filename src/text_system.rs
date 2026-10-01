@@ -1,5 +1,6 @@
 // Modified by ibis inc. for ibisOffice (2026-09-25): a font whose features turn `kern` off is laid out without kerning.
 // Modified by ibis inc. for ibisOffice (2026-09-29): implemented `PlatformTextSystem::font_data` (fonts added with `add_fonts` keep their data for it).
+// Modified by ibis inc. for ibisOffice (2026-10-01): `set_font_smoothing` turns CoreGraphics' font smoothing (which thickens glyph stems) off for the glyphs rasterized after it.
 use anyhow::anyhow;
 use cocoa::appkit::CGFloat;
 use collections::{HashMap, HashSet};
@@ -266,7 +267,7 @@ impl PlatformTextSystem for MacTextSystem {
         // When font smoothing is enabled, CoreGraphics thickens glyph strokes by an amount that
         // depends on the foreground color's luminance. We replicate the logic used by CoreGraphics
         // to select between the different levels of dilation.
-        if !font_smoothing_allowed_by_user() {
+        if !font_smoothing_allowed_by_user() || !font_smoothing_enabled() {
             return 0;
         }
         let rgba: Rgba = color.into();
@@ -274,6 +275,26 @@ impl PlatformTextSystem for MacTextSystem {
         let level = ((4.0 * luminance) + 0.5).floor() as i32;
         level.clamp(0, 4) as u8
     }
+}
+
+/// Whether glyphs are rasterized with CoreGraphics' font smoothing (see
+/// [`set_font_smoothing`]).
+static FONT_SMOOTHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Turn CoreGraphics' font smoothing on or off for the glyphs rasterized
+/// from now on (glyphs already in the atlas keep how they were drawn, so
+/// call it before anything is drawn). Smoothing thickens glyph stems, as
+/// macOS draws text on screen; without it glyphs are drawn with plain
+/// coverage antialiasing, as a PDF rasterizer draws them, for pictures
+/// meant to be compared with one.
+///
+/// Added in ibisOffice's fork of gpui-pre-macos 0.3.6.
+pub fn set_font_smoothing(enabled: bool) {
+    FONT_SMOOTHING.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn font_smoothing_enabled() -> bool {
+    FONT_SMOOTHING.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn font_smoothing_allowed_by_user() -> bool {
@@ -555,7 +576,12 @@ impl MacTextSystemState {
             cx.set_allows_font_subpixel_quantization(false);
             cx.set_should_subpixel_quantize_fonts(false);
 
-            if params.dilation > 0 {
+            if !font_smoothing_enabled() {
+                // A bitmap context smooths fonts unless told not to.
+                cx.set_allows_font_smoothing(false);
+                cx.set_should_smooth_fonts(false);
+                cx.set_gray_fill_color(0.0, 1.0);
+            } else if params.dilation > 0 {
                 let luminance = params.dilation as f64 * 0.25;
                 cx.set_should_smooth_fonts(true);
                 cx.set_gray_fill_color(luminance, 1.0);

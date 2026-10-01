@@ -1,3 +1,4 @@
+// Modified by ibis inc. for ibisOffice (2026-10-01): re-exports `set_font_smoothing`.
 #![cfg(target_os = "macos")]
 //! macOS platform implementation for GPUI.
 //!
@@ -56,6 +57,8 @@ pub(crate) use window::*;
 pub(crate) use text_system::*;
 
 pub use platform::MacPlatform;
+// Added in ibisOffice's fork: see `text_system::set_font_smoothing`.
+pub use text_system::set_font_smoothing;
 
 trait BoolExt {
     fn to_objc(self) -> BOOL;
