@@ -1,5 +1,6 @@
 // Modified by ibis inc. for ibisOffice (2026-09-25): a font whose features turn `kern` off is laid out without kerning.
 // Modified by ibis inc. for ibisOffice (2026-09-29): implemented `PlatformTextSystem::font_data` (fonts added with `add_fonts` keep their data for it).
+// Modified by ibis inc. for ibisOffice (2026-10-11): `layout_line` keeps the sized CTFont of each (font, size), instead of creating one for every line.
 // Modified by ibis inc. for ibisOffice (2026-10-01): `set_font_smoothing` turns CoreGraphics' font smoothing (which thickens glyph stems) off for the glyphs rasterized after it.
 use anyhow::anyhow;
 use cocoa::appkit::CGFloat;
@@ -77,6 +78,10 @@ struct MacTextSystemState {
     /// Fonts loaded with the `kern` feature set to 0, laid out without
     /// kerning (CoreText does not turn kerning off for the feature alone).
     unkerned: HashSet<FontId>,
+    /// The CTFont of a font at a size, by font and the size's bits: creating
+    /// one for every line made CoreText set up the font's tables each time
+    /// (half of the time of laying out a line).
+    sized_fonts: HashMap<(usize, u32), core_text::font::CTFont>,
     /// Font files read for `font_data`, by path.
     font_files: HashMap<std::path::PathBuf, Arc<Vec<u8>>>,
     /// The data of fonts added with `add_fonts`, by PostScript name, for
@@ -96,6 +101,7 @@ impl MacTextSystem {
             font_ids_by_font_key: HashMap::default(),
             postscript_names_by_font_id: HashMap::default(),
             unkerned: HashSet::default(),
+            sized_fonts: HashMap::default(),
             font_files: HashMap::default(),
             added_font_data: HashMap::default(),
         }))
@@ -643,12 +649,16 @@ impl MacTextSystemState {
                 } else {
                     font_size
                 };
+                if self.sized_fonts.len() > 4096 {
+                    self.sized_fonts.clear();
+                }
+                let sized = self
+                    .sized_fonts
+                    .entry((run.font_id.0, f32::from(font_size).to_bits()))
+                    .or_insert_with(|| font.native_font().clone_with_font_size(font_size.into()))
+                    .clone();
                 unsafe {
-                    string.set_attribute(
-                        cf_range,
-                        kCTFontAttributeName,
-                        &font.native_font().clone_with_font_size(font_size.into()),
-                    );
+                    string.set_attribute(cf_range, kCTFontAttributeName, &sized);
                     if self.unkerned.contains(&run.font_id) {
                         string.set_attribute(cf_range, kCTKernAttributeName, &CFNumber::from(0.0f64));
                     }
