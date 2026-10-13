@@ -831,6 +831,13 @@ impl Platform for MacPlatform {
                 panel.setCanCreateDirectories(true);
                 panel.setResolvesAliases(false);
 
+                // Files of other extensions are greyed out (modified by ibis inc.).
+                if !options.extensions.is_empty() && !options.directories {
+                    let types: Vec<_> = options.extensions.iter().map(|e| NSString::from_str(e)).collect();
+                    #[allow(deprecated)]
+                    panel.setAllowedFileTypes(Some(&NSArray::from_retained_slice(&types)));
+                }
+
                 let done_tx = Cell::new(Some(done_tx));
                 let handler = RcBlock::new({
                     let panel = panel.clone();
