@@ -835,7 +835,7 @@ impl Platform for MacPlatform {
                 if !options.extensions.is_empty() && !options.directories {
                     let types: Vec<_> = options.extensions.iter().map(|e| NSString::from_str(e)).collect();
                     #[allow(deprecated)]
-                    panel.setAllowedFileTypes(Some(&NSArray::from_retained_slice(&types)));
+                    panel.setAllowedFileTypes(Some(&objc2_foundation::NSArray::from_retained_slice(&types)));
                 }
 
                 let done_tx = Cell::new(Some(done_tx));
