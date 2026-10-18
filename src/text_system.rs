@@ -222,8 +222,10 @@ impl PlatformTextSystem for MacTextSystem {
         let index = if data.starts_with(b"ttcf") && data.len() >= 12 {
             let count = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
             let name = font.postscript_name();
+            // The names read from the collection's own tables: loading each font of it through font-kit copied the whole
+            // file (183 MB for Yu Gothic) once per try (modified by ibis inc.).
             (0..count)
-                .find(|&i| FontKitFont::from_bytes(data.clone(), i).ok().and_then(|f| f.postscript_name()) == name)
+                .find(|&i| collection_postscript_name(&data, i) == name)
                 .unwrap_or(0)
         } else {
             0
@@ -996,4 +998,40 @@ mod tests {
         assert_eq!(layout.len, 0);
         assert!(layout.runs.is_empty());
     }
+}
+
+/// The PostScript name (name ID 6) of font `index` of the TrueType collection `data`, read from its `name` table
+/// (modified by ibis inc.: added).
+fn collection_postscript_name(data: &[u8], index: u32) -> Option<String> {
+    let u16_at = |at: usize| data.get(at..at + 2).map(|b| u16::from_be_bytes([b[0], b[1]]) as usize);
+    let u32_at = |at: usize| data.get(at..at + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize);
+    let font = u32_at(12 + 4 * index as usize)?;
+    let tables = u16_at(font + 4)?;
+    let name_table = (0..tables).find_map(|t| {
+        let record = font + 12 + 16 * t;
+        (data.get(record..record + 4)? == b"name").then(|| u32_at(record + 8))?
+    })?;
+    let count = u16_at(name_table + 2)?;
+    let strings = name_table + u16_at(name_table + 4)?;
+    let mut found = None;
+    for n in 0..count {
+        let record = name_table + 6 + 12 * n;
+        if u16_at(record + 6)? != 6 {
+            continue;
+        }
+        let (platform, length, offset) = (u16_at(record)?, u16_at(record + 8)?, u16_at(record + 10)?);
+        let bytes = data.get(strings + offset..strings + offset + length)?;
+        let text = match platform {
+            // Windows: UTF-16 big endian.
+            3 => String::from_utf16(&bytes.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect::<Vec<_>>()).ok()?,
+            // Macintosh: ASCII for the names that matter.
+            1 => String::from_utf8_lossy(bytes).into_owned(),
+            _ => continue,
+        };
+        if platform == 3 {
+            return Some(text);
+        }
+        found.get_or_insert(text);
+    }
+    found
 }
