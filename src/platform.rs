@@ -14,7 +14,8 @@ use cocoa::{
     },
     base::{BOOL, NO, YES, id, nil, selector},
     foundation::{
-        NSArray, NSAutoreleasePool, NSBundle, NSInteger, NSProcessInfo, NSString, NSUInteger, NSURL,
+        NSArray, NSAutoreleasePool, NSBundle, NSInteger, NSPoint, NSProcessInfo, NSRect, NSSize,
+        NSString, NSUInteger, NSURL,
     },
 };
 use core_foundation::{
@@ -32,8 +33,8 @@ use gpui::{
     Action, ActivityGuard, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle,
     ForegroundExecutor, KeyContext, Keymap, Menu, MenuItem, OsMenu, OwnedMenu, PathPromptOptions,
     Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PlatformWindow, Result, SystemMenuType, Task, ThermalState, WindowAppearance, WindowKind,
-    WindowParams, popup::PopupNotSupportedError,
+    PlatformWindow, Result, SaveFormat, SystemMenuType, Task, ThermalState, WindowAppearance,
+    WindowKind, WindowParams, popup::PopupNotSupportedError,
 };
 use gpui_util::{ResultExt, new_std_command};
 use itertools::Itertools;
@@ -941,6 +942,112 @@ impl Platform for MacPlatform {
         done_rx
     }
 
+    /// The save dialog with a pop-up menu of formats beside the name (modified by ibis inc.: added).
+    /// Choosing a format gives the name its extension and makes the panel's default extension that; a name
+    /// typed with another extension is kept (`allowsOtherFileTypes`).
+    fn prompt_for_new_path_with_formats(
+        &self,
+        directory: &Path,
+        suggested_name: Option<&str>,
+        formats: &[SaveFormat],
+    ) -> oneshot::Receiver<Result<Option<PathBuf>>> {
+        if formats.is_empty() {
+            return self.prompt_for_new_path(directory, suggested_name);
+        }
+        use objc2_foundation::{NSString, NSURL};
+
+        let url = NSURL::from_directory_path(directory);
+        let suggested: Option<String> = suggested_name.map(str::to_string);
+        let formats: Vec<(String, Vec<String>)> = formats
+            .iter()
+            .filter(|f| !f.extensions.is_empty())
+            .map(|f| (f.label.to_string(), f.extensions.clone()))
+            .collect();
+        let (done_tx, done_rx) = oneshot::channel();
+        let marker = self.1;
+        self.foreground_executor()
+            .spawn(async move {
+                let panel = NSSavePanel::savePanel(marker);
+                panel.setDirectoryURL(url.as_deref());
+                panel.setAllowsOtherFileTypes(true);
+                if let Some(name) = suggested.as_deref() {
+                    panel.setNameFieldStringValue(&NSString::from_str(name));
+                }
+                // The format the suggested name's extension is of, else the first.
+                let matched = suggested
+                    .as_deref()
+                    .and_then(|n| Path::new(n).extension())
+                    .and_then(|e| e.to_str())
+                    .and_then(|e| {
+                        formats
+                            .iter()
+                            .position(|f| f.1.iter().any(|x| x.eq_ignore_ascii_case(e)))
+                    });
+                let initial = matched.unwrap_or(0);
+
+                let formats_ptr = Box::into_raw(Box::new(formats));
+                let (popup, picker) = unsafe {
+                    let formats = &*formats_ptr;
+                    let popup: id = msg_send![class!(NSPopUpButton), alloc];
+                    let popup: id = msg_send![popup, initWithFrame: NSRect::new(NSPoint::new(0., 0.), NSSize::new(260., 26.)) pullsDown: NO];
+                    for (label, _) in formats {
+                        let _: () = msg_send![popup, addItemWithTitle: ns_string(label)];
+                    }
+                    let _: () = msg_send![popup, selectItemAtIndex: initial as NSInteger];
+                    let picker: id = msg_send![save_format_picker_class(), new];
+                    (*(picker as *mut Object)).set_ivar::<*mut c_void>(
+                        "panel",
+                        objc2::rc::Retained::as_ptr(&panel) as *mut c_void,
+                    );
+                    (*(picker as *mut Object)).set_ivar::<*mut c_void>("formats", formats_ptr as *mut c_void);
+                    let _: () = msg_send![popup, setTarget: picker];
+                    let _: () = msg_send![popup, setAction: sel!(formatChanged:)];
+                    let panel_id = objc2::rc::Retained::as_ptr(&panel) as id;
+                    let _: () = msg_send![panel_id, setAccessoryView: popup];
+                    // The panel holds the pop-up now.
+                    let _: () = msg_send![popup, release];
+                    // The suggested name's format is the one the panel starts with (its extension is the name's already).
+                    if matched.is_some() {
+                        let _: () = msg_send![picker, formatChanged: popup];
+                    }
+                    (popup, picker)
+                };
+                let _ = popup;
+
+                let done_tx = Cell::new(Some(done_tx));
+                let picker_ptr = picker as usize;
+                let formats_addr = formats_ptr as usize;
+                let handler = RcBlock::new({
+                    let panel = panel.clone();
+                    move |response: NSModalResponse| {
+                        let Some(done_tx) = done_tx.take() else {
+                            return;
+                        };
+
+                        let result = if response == NSModalResponseOK {
+                            panel
+                                .URL()
+                                .filter(|url| url.isFileURL())
+                                .and_then(|url| url.to_file_path())
+                        } else {
+                            None
+                        };
+                        // The target of the pop-up and the formats it read are not needed any more.
+                        unsafe {
+                            let picker = picker_ptr as id;
+                            let _: () = msg_send![picker, release];
+                            drop(Box::from_raw(formats_addr as *mut Vec<(String, Vec<String>)>));
+                        }
+                        _ = done_tx.send(Ok(result));
+                    }
+                });
+
+                panel.beginWithCompletionHandler(&handler);
+            })
+            .detach();
+        done_rx
+    }
+
     fn can_select_mixed_files_and_dirs(&self) -> bool {
         true
     }
@@ -1579,6 +1686,57 @@ extern "C" fn handle_dock_menu(this: &mut Object, _: Sel, _: id) -> id {
         }
     }
 }
+
+/// The target of the save dialog's format pop-up (modified by ibis inc.: added): `formatChanged:` gives the panel the
+/// chosen format's extensions as its default and the name field that extension.
+fn save_format_picker_class() -> *const Class {
+    static CLASS: OnceLock<usize> = OnceLock::new();
+    *CLASS.get_or_init(|| {
+        let mut decl = ClassDecl::new("GPUISaveFormatPicker", class!(NSObject)).unwrap();
+        decl.add_ivar::<*mut c_void>("panel");
+        decl.add_ivar::<*mut c_void>("formats");
+        unsafe {
+            decl.add_method(
+                sel!(formatChanged:),
+                save_format_changed as extern "C" fn(&mut Object, Sel, id),
+            );
+        }
+        decl.register() as *const Class as usize
+    }) as *const Class
+}
+
+extern "C" fn save_format_changed(this: &mut Object, _: Sel, sender: id) {
+    unsafe {
+        let panel = *this.get_ivar::<*mut c_void>("panel") as id;
+        let formats = &*(*this.get_ivar::<*mut c_void>("formats") as *const Vec<(String, Vec<String>)>);
+        if panel.is_null() || sender.is_null() {
+            return;
+        }
+        let index: NSInteger = msg_send![sender, indexOfSelectedItem];
+        let Some((_, extensions)) = usize::try_from(index).ok().and_then(|i| formats.get(i)) else {
+            return;
+        };
+        let types: id = msg_send![class!(NSMutableArray), array];
+        for extension in extensions {
+            let _: () = msg_send![types, addObject: ns_string(extension)];
+        }
+        let _: () = msg_send![panel, setAllowedFileTypes: types];
+        // The name keeps its stem and takes the format's first extension.
+        let name: id = msg_send![panel, nameFieldStringValue];
+        let utf8: *const c_char = msg_send![name, UTF8String];
+        if utf8.is_null() {
+            return;
+        }
+        let name = CStr::from_ptr(utf8).to_string_lossy().into_owned();
+        let stem = match name.rsplit_once('.') {
+            Some((stem, _)) if !stem.is_empty() => stem.to_string(),
+            _ => name,
+        };
+        let renamed = format!("{stem}.{}", extensions[0]);
+        let _: () = msg_send![panel, setNameFieldStringValue: ns_string(&renamed)];
+    }
+}
+
 
 unsafe fn ns_url_to_path(url: id) -> Result<PathBuf> {
     let path: *mut c_char = msg_send![url, fileSystemRepresentation];
