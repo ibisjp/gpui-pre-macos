@@ -2,6 +2,7 @@
 // Modified by ibis inc. for ibisOffice (2026-09-29): implemented `PlatformTextSystem::font_data` (fonts added with `add_fonts` keep their data for it).
 // Modified by ibis inc. for ibisOffice (2026-10-11): `layout_line` keeps the sized CTFont of each (font, size), instead of creating one for every line.
 // Modified by ibis inc. for ibisOffice (2026-10-01): `set_font_smoothing` turns CoreGraphics' font smoothing (which thickens glyph stems) off for the glyphs rasterized after it.
+// Modified by ibis inc. for ibisOffice (2026-10-20): bold or italic asked of a family without that face (Japanese fonts) is drawn emboldened (filled and outlined) or slanted (through the font's matrix), fallback fonts too.
 use anyhow::anyhow;
 use cocoa::appkit::CGFloat;
 use collections::{HashMap, HashSet};
@@ -87,6 +88,28 @@ struct MacTextSystemState {
     /// The data of fonts added with `add_fonts`, by PostScript name, for
     /// `font_data` (they are loaded through CoreText, which keeps no data).
     added_font_data: HashMap<String, Arc<Vec<u8>>>,
+    /// Fonts drawn slanted and/or emboldened because their family has no italic or bold face (Japanese fonts such as
+    /// Yu Mincho or MS Mincho): the font they copy, and whether they are emboldened and slanted (modified by ibis inc.).
+    synthetic: HashMap<FontId, (FontId, bool, bool)>,
+    /// The synthetic copy of a font, by the font and whether it is emboldened and slanted.
+    synthetic_ids: HashMap<(FontId, bool, bool), FontId>,
+    /// Whether the text a font was chosen for asked for bold and italic: a fallback font CoreText takes for some of
+    /// that text (Japanese in an Italic Latin font) is drawn emboldened or slanted when it has no such face.
+    wanted_styles: HashMap<FontId, (bool, bool)>,
+}
+
+/// How far a synthetic italic slants: x moves by this much of y (about 11°, as Word and Excel slant a font without an italic).
+const SYNTHETIC_SLANT: CGFloat = 0.2;
+/// The width of the outline a synthetic bold is drawn with, in ems.
+const SYNTHETIC_BOLD_STROKE: f32 = 0.035;
+
+unsafe extern "C" {
+    fn CTFontCreateCopyWithAttributes(
+        font: core_text::font::CTFontRef,
+        size: CGFloat,
+        matrix: *const core_graphics::geometry::CGAffineTransform,
+        attributes: core_text::font_descriptor::CTFontDescriptorRef,
+    ) -> core_text::font::CTFontRef;
 }
 
 impl MacTextSystem {
@@ -104,6 +127,9 @@ impl MacTextSystem {
             sized_fonts: HashMap::default(),
             font_files: HashMap::default(),
             added_font_data: HashMap::default(),
+            synthetic: HashMap::default(),
+            synthetic_ids: HashMap::default(),
+            wanted_styles: HashMap::default(),
         }))
     }
 }
@@ -188,6 +214,18 @@ impl PlatformTextSystem for MacTextSystem {
             )?;
 
             let font_id = candidates[ix];
+            // A family without an italic or bold face (most Japanese fonts): the face found is drawn slanted or emboldened.
+            let found = candidate_properties[ix];
+            let want_italic = font.style != FontStyle::Normal;
+            let want_bold = font.weight.0 >= 600.0;
+            let font_id = lock.ensure_synthetic(
+                font_id,
+                want_bold && found.weight.0 < 600.0,
+                want_italic && found.style == FontkitStyle::Normal,
+            );
+            if want_bold || want_italic {
+                lock.wanted_styles.insert(font_id, (want_bold, want_italic));
+            }
             lock.font_selections.insert(font.clone(), font_id);
             Ok(font_id)
         }
@@ -245,6 +283,10 @@ impl PlatformTextSystem for MacTextSystem {
 
     fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
         self.0.read().glyph_for_char(font_id, ch)
+    }
+
+    fn synthetic_style(&self, font_id: FontId) -> (bool, bool) {
+        self.0.read().synthetic_style(font_id)
     }
 
     fn glyph_raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
@@ -477,6 +519,35 @@ impl MacTextSystemState {
         self.fonts[font_id.0].glyph_for_char(ch).map(GlyphId)
     }
 
+    /// The copy of `base` drawn emboldened (`bold`) and/or slanted (`italic`), made the first time it is asked for;
+    /// `base` itself when neither is asked for (modified by ibis inc.).
+    fn ensure_synthetic(&mut self, base: FontId, bold: bool, italic: bool) -> FontId {
+        let base = self.synthetic.get(&base).map_or(base, |s| s.0);
+        if !bold && !italic {
+            return base;
+        }
+        if let Some(id) = self.synthetic_ids.get(&(base, bold, italic)) {
+            return *id;
+        }
+        let id = FontId(self.fonts.len());
+        let font = self.fonts[base.0].clone();
+        self.fonts.push(font);
+        if let Some(name) = self.postscript_names_by_font_id.get(&base).cloned() {
+            self.postscript_names_by_font_id.insert(id, name);
+        }
+        if self.unkerned.contains(&base) {
+            self.unkerned.insert(id);
+        }
+        self.synthetic.insert(id, (base, bold, italic));
+        self.synthetic_ids.insert((base, bold, italic), id);
+        id
+    }
+
+    /// Whether a font is drawn emboldened and slanted.
+    fn synthetic_style(&self, font_id: FontId) -> (bool, bool) {
+        self.synthetic.get(&font_id).map_or((false, false), |s| (s.1, s.2))
+    }
+
     fn id_for_native_font(&mut self, requested_font: CTFont) -> FontId {
         let postscript_name = requested_font.postscript_name();
         if let Some(font_id) = self.font_ids_by_postscript_name.get(&postscript_name) {
@@ -515,7 +586,20 @@ impl MacTextSystemState {
         )?);
 
         // Expand the bounds by 1 pixel on each side to give CG room for anti-aliasing.
-        Ok(bounds.dilate(DevicePixels(1)))
+        let mut bounds = bounds.dilate(DevicePixels(1));
+        // A synthetic italic leans out on both sides (right above the baseline, left below it), a synthetic bold's outline
+        // goes out all round (modified by ibis inc.).
+        let (bold, italic) = self.synthetic_style(params.font_id);
+        let em = f32::from(params.font_size) * params.scale_factor;
+        if italic {
+            let lean = DevicePixels((em * SYNTHETIC_SLANT as f32).ceil() as i32);
+            bounds.origin.x -= lean;
+            bounds.size.width += lean + lean;
+        }
+        if bold {
+            bounds = bounds.dilate(DevicePixels((em * SYNTHETIC_BOLD_STROKE / 2.0).ceil() as i32 + 1));
+        }
+        Ok(bounds)
     }
 
     fn rasterize_glyph(
@@ -596,9 +680,29 @@ impl MacTextSystemState {
             } else {
                 cx.set_gray_fill_color(0.0, 1.0);
             }
-            self.fonts[params.font_id.0]
-                .native_font()
-                .clone_with_font_size(f32::from(params.font_size) as CGFloat)
+            let (bold, italic) = self.synthetic_style(params.font_id);
+            let font_size = f32::from(params.font_size) as CGFloat;
+            let mut native = self.fonts[params.font_id.0].native_font().clone_with_font_size(font_size);
+            if italic {
+                // Slanted by the font's matrix, which CoreText draws the glyph through (modified by ibis inc.).
+                let matrix = core_graphics::geometry::CGAffineTransform::new(1.0, 0.0, SYNTHETIC_SLANT, 1.0, 0.0, 0.0);
+                native = unsafe {
+                    CTFont::wrap_under_create_rule(CTFontCreateCopyWithAttributes(
+                        native.as_concrete_TypeRef(),
+                        font_size,
+                        &matrix,
+                        std::ptr::null(),
+                    ))
+                };
+            }
+            if bold {
+                // Filled and outlined in the same colour: the strokes thicker all round (modified by ibis inc.).
+                cx.set_text_drawing_mode(CGTextDrawingMode::CGTextFillStroke);
+                cx.set_line_width(font_size * SYNTHETIC_BOLD_STROKE as CGFloat);
+                let luminance = if font_smoothing_enabled() && params.dilation > 0 { params.dilation as f64 * 0.25 } else { 0.0 };
+                cx.set_rgb_stroke_color(luminance, luminance, luminance, 1.0);
+            }
+            native
                 .draw_glyphs(
                     &[params.glyph_id.0 as CGGlyph],
                     &[CGPoint::new(
@@ -624,6 +728,8 @@ impl MacTextSystemState {
         let mut string = CFMutableAttributedString::new();
         let mut max_ascent = 0.0f32;
         let mut max_descent = 0.0f32;
+        // Each run's UTF-16 range and font, to find what the text a glyph run shows asked for (modified by ibis inc.).
+        let mut run_ranges: SmallVec<[(isize, isize, FontId); 4]> = SmallVec::new();
 
         {
             let mut text = text;
@@ -638,6 +744,7 @@ impl MacTextSystemState {
                 let utf16_end = string.char_len();
 
                 let length = utf16_end - utf16_start;
+                run_ranges.push((utf16_start, utf16_end, run.font_id));
                 let cf_range = CFRange::init(utf16_start, length);
                 let font = &self.fonts[run.font_id.0];
 
@@ -681,7 +788,24 @@ impl MacTextSystemState {
                     .downcast::<CTFont>()
                     .unwrap()
             };
-            let font_id = self.id_for_native_font(font);
+            let font_id = self.id_for_native_font(font.clone());
+            // Text that asked for bold or italic, shown in a font without that face (its own family's, or a fallback
+            // CoreText took): drawn emboldened or slanted (modified by ibis inc.).
+            let first_index = run.string_indices().first().copied().unwrap_or(0) as isize;
+            let wanted = run_ranges
+                .iter()
+                .find(|(start, end, _)| (*start..*end).contains(&first_index))
+                .and_then(|(_, _, id)| self.wanted_styles.get(id).copied());
+            let font_id = match wanted {
+                Some((want_bold, want_italic)) => {
+                    use core_text::font_descriptor::SymbolicTraitAccessors;
+                    let traits = font.symbolic_traits();
+                    let weight = unsafe { font.all_traits().get(kCTFontWeightTrait).downcast::<CFNumber>().and_then(|n| n.to_f64()).unwrap_or(0.0) };
+                    let has_bold = traits.is_bold() || weight >= 0.3;
+                    self.ensure_synthetic(font_id, want_bold && !has_bold, want_italic && !traits.is_italic())
+                }
+                None => font_id,
+            };
 
             let glyphs = match runs.last_mut() {
                 Some(run) if run.font_id == font_id => &mut run.glyphs,
