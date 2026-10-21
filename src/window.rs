@@ -1,3 +1,4 @@
+// Modified by ibis inc. for ibisOffice (2026-10-21): use a fixed `GPUIContentView` subclass with `accesskit_macos::Adapter` instead of `SubclassingAdapter::for_window` so AppKit's KVO subclass on `nextResponder` (used by Touch Bar) is not clobbered on teardown (GitHub issue #17, contributed by uchidama under CLA: https://github.com/ibisjp/ibis-office/issues/17#issuecomment-6301723328).
 use crate::{
     BoolExt, MacDisplay, NSRange, NSStringExt, TISCopyCurrentKeyboardInputSource,
     TISGetInputSourceProperty, WindowFrameSource, events::platform_input_from_native,
@@ -87,6 +88,7 @@ static RESTORES_WORKSPACE_AT_LAUNCH_DEFAULT: Once = Once::new();
 static mut WINDOW_CLASS: *const Class = ptr::null();
 static mut PANEL_CLASS: *const Class = ptr::null();
 static mut VIEW_CLASS: *const Class = ptr::null();
+static mut CONTENT_VIEW_CLASS: *const Class = ptr::null();
 static mut BLURRED_VIEW_CLASS: *const Class = ptr::null();
 static mut WINDOW_STATE_ARCHIVER_DELEGATE_CLASS: *const Class = ptr::null();
 static mut WINDOW_STATE_UNARCHIVER_CLASS: *const Class = ptr::null();
@@ -127,6 +129,27 @@ unsafe fn build_classes() {
     unsafe {
         WINDOW_CLASS = build_window_class("GPUIWindow", class!(NSWindow));
         PANEL_CLASS = build_window_class("GPUIPanel", class!(NSPanel));
+        CONTENT_VIEW_CLASS = {
+            // Keep the Objective-C class stable for the lifetime of the view.
+            // SubclassingAdapter restores its original class on drop, discarding
+            // AppKit's KVO subclass while the Touch Bar still observes nextResponder.
+            let mut decl = ClassDecl::new("GPUIContentView", class!(NSView)).unwrap();
+            decl.add_ivar::<*mut c_void>(WINDOW_STATE_IVAR);
+            decl.add_method(sel!(dealloc), dealloc_view as extern "C" fn(&Object, Sel));
+            decl.add_method(
+                sel!(accessibilityChildren),
+                accessibility_children as extern "C" fn(&Object, Sel) -> id,
+            );
+            decl.add_method(
+                sel!(accessibilityFocusedUIElement),
+                accessibility_focus as extern "C" fn(&Object, Sel) -> id,
+            );
+            decl.add_method(
+                sel!(accessibilityHitTest:),
+                accessibility_hit_test as extern "C" fn(&Object, Sel, NSPoint) -> id,
+            );
+            decl.register()
+        };
         VIEW_CLASS = {
             let mut decl = ClassDecl::new("GPUIView", class!(NSView)).unwrap();
             decl.add_ivar::<*mut c_void>(WINDOW_STATE_IVAR);
@@ -707,7 +730,7 @@ struct MacWindowState {
     toggle_tab_bar_callback: Option<Box<dyn FnMut()>>,
     activated_least_once: bool,
     closed: Arc<AtomicBool>,
-    accesskit_adapter: Option<accesskit_macos::SubclassingAdapter>,
+    accesskit_adapter: Option<MacAccessibility>,
     // The parent window if this window is a sheet (Dialog kind)
     sheet_parent: Option<id>,
 }
@@ -1158,6 +1181,16 @@ impl MacWindow {
                 Arc::into_raw(window.0.clone()) as *const c_void,
             );
 
+            let accessible_content_view: id = msg_send![CONTENT_VIEW_CLASS, alloc];
+            let content_view =
+                NSView::initWithFrame_(accessible_content_view, NSView::frame(content_view));
+            assert!(!content_view.is_null());
+            (*content_view).set_ivar(
+                WINDOW_STATE_IVAR,
+                Arc::into_raw(window.0.clone()) as *const c_void,
+            );
+            native_window.setContentView_(content_view.autorelease());
+
             if let Some(title) = titlebar
                 .as_ref()
                 .and_then(|t| t.title.as_ref().map(AsRef::as_ref))
@@ -1375,14 +1408,8 @@ impl MacWindow {
 impl Drop for MacWindow {
     fn drop(&mut self) {
         let mut this = self.0.lock();
-        // `accesskit_macos::SubclassingAdapter::for_window` strong-retains the
-        // window's content view, and that content view keeps the `GPUIView` it
-        // hosts alive. Together with the `Arc<Mutex<MacWindowState>>` parked in
-        // both views' `windowState` ivar, that forms
-        // `MacWindowState -> adapter -> content view -> GPUIView -> MacWindowState`,
-        // a cycle the delegate/`frame_source` teardown below cannot break. Drop
-        // the adapter here so the native view, its `CAMetalLayer` and the
-        // renderer's command queue are actually released with the window.
+        // Adapter keeps only a weak reference to the content view and never
+        // changes its class. Retire the accessibility tree before native teardown.
         drop(this.accesskit_adapter.take());
         this.renderer.destroy();
         let window = this.native_window;
@@ -2361,15 +2388,21 @@ impl PlatformWindow for MacWindow {
         };
         let action_handler = A11yActionHandler(callbacks.action);
 
+        // SAFETY: GPUIContentView is a live NSView owned by native_window;
+        // accessibility initialization runs on the main thread. Adapter holds
+        // a weak reference, so the content view can release its window state.
         let adapter = unsafe {
-            accesskit_macos::SubclassingAdapter::for_window(
-                lock.native_window as *mut c_void,
-                activation_handler,
+            accesskit_macos::Adapter::new(
+                lock.native_window.contentView() as *mut c_void,
+                false,
                 action_handler,
             )
         };
 
-        lock.accesskit_adapter = Some(adapter);
+        lock.accesskit_adapter = Some(MacAccessibility {
+            adapter,
+            activation_handler,
+        });
     }
 
     fn a11y_tree_update(&self, tree_update: accesskit::TreeUpdate) {
@@ -2377,7 +2410,7 @@ impl PlatformWindow for MacWindow {
             let mut lock = self.0.lock();
             lock.accesskit_adapter
                 .as_mut()
-                .and_then(|adapter| adapter.update_if_active(|| tree_update))
+                .and_then(|accessibility| accessibility.adapter.update_if_active(|| tree_update))
         };
         if let Some(events) = events {
             events.raise();
@@ -2391,6 +2424,46 @@ impl PlatformWindow for MacWindow {
 
 struct A11yActivationHandler {
     callback: Box<dyn Fn() -> Option<accesskit::TreeUpdate> + Send + 'static>,
+}
+
+struct MacAccessibility {
+    adapter: accesskit_macos::Adapter,
+    activation_handler: A11yActivationHandler,
+}
+
+// Activation can call back into GPUI. Do not hold the window mutex across it.
+fn with_accessibility(this: &Object, f: impl FnOnce(&mut MacAccessibility) -> id) -> id {
+    let state = unsafe { get_window_state(this) };
+    let Some(mut accessibility) = state.lock().accesskit_adapter.take() else {
+        return nil;
+    };
+    let result = f(&mut accessibility);
+    let mut lock = state.lock();
+    if !lock.closed.load(Ordering::Acquire) {
+        lock.accesskit_adapter = Some(accessibility);
+    }
+    result
+}
+
+extern "C" fn accessibility_children(this: &Object, _: Sel) -> id {
+    with_accessibility(this, |a11y| {
+        a11y.adapter.view_children(&mut a11y.activation_handler) as id
+    })
+}
+
+extern "C" fn accessibility_focus(this: &Object, _: Sel) -> id {
+    with_accessibility(this, |a11y| {
+        a11y.adapter.focus(&mut a11y.activation_handler) as id
+    })
+}
+
+extern "C" fn accessibility_hit_test(this: &Object, _: Sel, point: NSPoint) -> id {
+    with_accessibility(this, |a11y| {
+        a11y.adapter.hit_test(
+            accesskit_macos::NSPoint::new(point.x, point.y),
+            &mut a11y.activation_handler,
+        ) as id
+    })
 }
 
 impl accesskit::ActivationHandler for A11yActivationHandler {
@@ -3148,7 +3221,7 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
         let mut lock = window_state.lock();
         lock.accesskit_adapter
             .as_mut()
-            .and_then(|adapter| adapter.update_view_focus_state(is_active))
+            .and_then(|accessibility| accessibility.adapter.update_view_focus_state(is_active))
     };
     if let Some(events) = a11y_events {
         events.raise();
