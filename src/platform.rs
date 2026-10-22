@@ -820,11 +820,18 @@ impl Platform for MacPlatform {
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
         use objc2_foundation::NSString;
 
-        let marker = self.1;
+        let _marker = self.1;
         let (done_tx, done_rx) = oneshot::channel();
         self.foreground_executor()
             .spawn(async move {
-                let panel = NSOpenPanel::openPanel(marker);
+                // [NSOpenPanel openPanel] returns nil if macOS openAndSavePanelService XPC fails
+                // (e.g., when the running .app bundle on disk was removed or replaced while open);
+                // guard against nil instead of panicking in objc2's none_fail (modified by ibis inc.).
+                let raw_panel: *mut NSOpenPanel = unsafe { msg_send![class!(NSOpenPanel), openPanel] };
+                let Some(panel) = (unsafe { objc2::rc::Retained::retain(raw_panel) }) else {
+                    _ = done_tx.send(Err(anyhow!("NSOpenPanel::openPanel returned nil")));
+                    return;
+                };
                 panel.setCanChooseDirectories(options.directories);
                 panel.setCanChooseFiles(options.files);
                 panel.setAllowsMultipleSelection(options.multiple);
@@ -879,10 +886,15 @@ impl Platform for MacPlatform {
         let url = NSURL::from_directory_path(directory);
         let suggested_name = suggested_name.map(NSString::from_str);
         let (done_tx, done_rx) = oneshot::channel();
-        let marker = self.1;
+        let _marker = self.1;
         self.foreground_executor()
             .spawn(async move {
-                let panel = NSSavePanel::savePanel(marker);
+                // Guard against nil from [NSSavePanel savePanel] (modified by ibis inc.).
+                let raw_panel: *mut NSSavePanel = unsafe { msg_send![class!(NSSavePanel), savePanel] };
+                let Some(panel) = (unsafe { objc2::rc::Retained::retain(raw_panel) }) else {
+                    _ = done_tx.send(Err(anyhow!("NSSavePanel::savePanel returned nil")));
+                    return;
+                };
                 panel.setDirectoryURL(url.as_deref());
 
                 if let Some(suggested_name) = suggested_name {
@@ -964,10 +976,15 @@ impl Platform for MacPlatform {
             .map(|f| (f.label.to_string(), f.extensions.clone()))
             .collect();
         let (done_tx, done_rx) = oneshot::channel();
-        let marker = self.1;
+        let _marker = self.1;
         self.foreground_executor()
             .spawn(async move {
-                let panel = NSSavePanel::savePanel(marker);
+                // Guard against nil from [NSSavePanel savePanel] (modified by ibis inc.).
+                let raw_panel: *mut NSSavePanel = unsafe { msg_send![class!(NSSavePanel), savePanel] };
+                let Some(panel) = (unsafe { objc2::rc::Retained::retain(raw_panel) }) else {
+                    _ = done_tx.send(Err(anyhow!("NSSavePanel::savePanel returned nil")));
+                    return;
+                };
                 panel.setDirectoryURL(url.as_deref());
                 panel.setAllowsOtherFileTypes(true);
                 if let Some(name) = suggested.as_deref() {
