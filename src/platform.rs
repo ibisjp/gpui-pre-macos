@@ -101,8 +101,9 @@ unsafe fn build_classes() {
                 should_handle_reopen as extern "C" fn(&mut Object, Sel, id, bool),
             );
             decl.add_method(
-                sel!(applicationWillTerminate:),
-                will_terminate as extern "C" fn(&mut Object, Sel, id),
+                // Modified by ibis inc.: ask before termination so unsaved work may cancel it.
+                sel!(applicationShouldTerminate:),
+                should_terminate as extern "C" fn(&mut Object, Sel, id) -> usize,
             );
             decl.add_method(
                 sel!(handleGPUIMenuItem:),
@@ -1520,13 +1521,19 @@ extern "C" fn should_handle_reopen(this: &mut Object, _: Sel, _: id, has_open_wi
     }
 }
 
-extern "C" fn will_terminate(this: &mut Object, _: Sel, _: id) {
+// Modified by ibis inc.: return AppKit's NSTerminateCancel (0) or NSTerminateNow (1).
+// applicationWillTerminate: is too late to keep unsaved document windows alive.
+extern "C" fn should_terminate(this: &mut Object, _: Sel, _: id) -> usize {
     let platform = unsafe { get_mac_platform(this) };
     let mut lock = platform.0.lock();
     if let Some(mut callback) = lock.quit.take() {
         drop(lock);
-        callback();
+        let allowed = callback();
         platform.0.lock().quit.get_or_insert(callback);
+        usize::from(allowed)
+    } else {
+        // A callback in progress cannot authorize a second, nested request.
+        0
     }
 }
 
